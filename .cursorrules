@@ -1,0 +1,81 @@
+You are helping me build "Relay" for the FalkorDB "Graph Hacks" hackathon,
+Track 02: Agent Memory and Coordination.
+
+PRODUCT
+A multi-tenant support crew of 3 agents (Triage, Resolver, Follow-up) that
+remembers every customer across sessions, learns playbooks from resolved
+tickets, and hands tasks between agents through shared graph state.
+Judging focus: episodic/semantic/procedural memory, persistent history,
+handoffs, high-concurrency reads/writes, per-tenant isolation, explainability.
+
+STACK (TypeScript everywhere, monorepo with npm workspaces)
+- apps/api: Node 20, Express, zod validation, pino logging. Stateless.
+- apps/worker: Node process, consumes Redis Streams. Horizontally scalable.
+- apps/web: React + Vite + Tailwind, react-force-graph-2d, SSE client.
+- packages/memory: FalkorDB memory layer (the core library).
+- packages/agents: agent logic + LLM provider abstraction.
+- packages/mcp: MCP server exposing memory tools.
+- packages/shared: types, zod schemas, constants.
+- loadtest/: k6 scripts.
+- Infra via docker-compose: falkordb, redis (streams/locks/rate limits),
+  mongodb (tenants, users, API keys, outbox, audit), nginx (load balancer),
+  api (x3 replicas), worker (x3 replicas), prometheus, grafana, web.
+
+DATA OWNERSHIP RULES
+- FalkorDB = ALL memory (episodic, semantic, procedural, tasks). It is the
+  primary store and must be central to every agent decision.
+- MongoDB = tenants, users, API keys, transactional outbox, audit log only.
+- Redis = Streams (events/handoffs), distributed locks, rate limiting,
+  idempotency keys, SSE pub/sub. Not a source of truth for memory.
+
+DISTRIBUTED SYSTEM RULES
+1. Tenant isolation: one FalkorDB graph per tenant named `t_{tenantId}`.
+   A single `getTenantGraph(tenantId)` function is the ONLY way to get a graph
+   handle. Never build graph names from raw request input.
+   A shared graph `global_playbooks` stores anonymized playbooks (no PII).
+2. Handoffs: Redis Streams with consumer groups, XACK after success, retry
+   with backoff, dead-letter stream after 5 failures, XAUTOCLAIM for stuck
+   messages. One stream per stage: `stream:triage`, `stream:resolve`,
+   `stream:followup`, `stream:dlq`.
+3. Idempotency: every message carries an idempotencyKey; processing is
+   skipped if already recorded (Redis SET NX with TTL).
+4. Transactional outbox: API writes the ticket + outbox row in MongoDB in one
+   transaction; an outbox relay publishes to Redis Streams (at-least-once).
+5. Concurrency control: Task nodes have a `version` int. Updates use
+   compare-and-set in Cypher. Also take a short Redis lock (SET NX PX) per
+   taskId when an agent claims it.
+6. Rate limiting: per-tenant token bucket in Redis (Lua script).
+7. Backpressure: API returns 429 with Retry-After when a stream's pending
+   length exceeds a threshold.
+8. Observability: Prometheus metrics (request latency histograms, stream lag,
+   graph query latency, handoff latency, DLQ size) + correlation IDs
+   propagated API -> stream -> worker -> graph write.
+9. Graceful shutdown: workers finish in-flight messages before exit.
+
+GRAPH SCHEMA (per tenant graph)
+Nodes: Customer, Session, Event, Fact, Entity, Task, Playbook, AgentRun
+Edges:
+ (Customer)-[:HAS_SESSION]->(Session)
+ (Session)-[:CONTAINS]->(Event); (Event)-[:NEXT]->(Event)
+ (Event)-[:MENTIONS]->(Entity)
+ (Customer)-[:HAS_FACT]->(Fact); (Fact)-[:DERIVED_FROM]->(Event)
+ (Fact)-[:SUPERSEDES]->(Fact)
+ (Task)-[:ABOUT]->(Customer); (Task)-[:ORIGINATED_IN]->(Event)
+ (Task)-[:HANDED_OFF_TO {snapshot, at, from, to}]->(AgentRun)
+ (AgentRun)-[:READ]->(Fact|Event|Playbook)   // powers explainability
+ (AgentRun)-[:WROTE]->(Fact|Event)
+ (Task)-[:RESOLVED_WITH {success}]->(Playbook)
+Fact props: key, value, confidence, validFrom, validTo, status(active|superseded|decayed)
+Playbook props: issueType, steps[], uses, successes, successRate
+Indexes: create on Customer.id, Event.ts, Fact.key, Task.id, Playbook.issueType.
+
+CODING RULES
+- Strict TypeScript, zod at every boundary, no `any`.
+- Parameterized Cypher only. Never string-interpolate user input.
+- Every agent run records AgentRun + READ/WROTE edges.
+- LLM calls go through an LlmProvider interface with an Anthropic
+  implementation and a deterministic MockProvider (used in tests, load tests,
+  and when no API key is set).
+- Write unit tests (vitest) for the memory package and integration tests
+  for isolation, idempotency, and handoff.
+- Keep files small, add short README sections per package.

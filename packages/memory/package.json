@@ -1,0 +1,23 @@
+{
+  "name": "@relay/memory",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@relay/shared": "*",
+    "falkordb": "^6.4.0",
+    "redis": "^4.7.0",
+    "zod": "^3.24.1"
+  }
+}
